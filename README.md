@@ -26,6 +26,15 @@ Terminals that hit this: **Windows Terminal** (Sixel but no Kitty, so images wer
 
 The easiest reproduction to see is the dsh-TUI whale-girl mascot (`companion.skin: whaleGirl`): it flashes for ~0.1 s and then goes permanently blank. Any comparable image-drawing program reproduces the same bug.
 
+## 修复后的样子
+## After the fix
+
+![修复后：在 Windows Terminal 里运行 herdr，dsh-TUI 的鲸娘吉祥物稳定显示](https://raw.githubusercontent.com/Banyan-leaf/herdr-kitty-graphics-patch/main/docs/screenshot-windows-terminal.jpg)
+
+实拍（Windows Terminal + WSL，会话 `whalegirl-check`）：作为复现案例的鲸娘吉祥物正常渲染并持续动画，不再"闪一下就没"。任何画图的程序都会得到同样的结果——要么显示图像，要么显示它自己的字符画/占位保底，而不是两者都没有。
+
+A photo of the screen (Windows Terminal + WSL, session `whalegirl-check`): the whale-girl mascot used as the reproduction case renders and keeps animating instead of flashing once and going blank. Any image-drawing program gets the same outcome — either its images or its own text/placeholder fallback, never neither.
+
 ---
 
 ## 文件夹里有什么
