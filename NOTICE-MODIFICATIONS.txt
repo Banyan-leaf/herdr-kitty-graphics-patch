@@ -1,0 +1,24 @@
+Herdr — unofficial modified build
+=================================
+
+This distribution contains a modified version of Herdr
+(https://github.com/herdrdev/herdr), which is licensed under the Apache
+License, Version 2.0. The full license text is in LICENSE.
+
+Modifications
+-------------
+- Upstream base: commit b064806 (master at build time)
+- Changes: one commit, also shipped here as
+  0001-fix-stop-advertising-kitty-graphics-herdr-cannot-del.patch
+- Summary: a pane terminal now answers the Kitty graphics capability query
+  according to what the attached client's outer terminal can actually
+  display, and `terminal.kitty_graphics = false` fully disables the protocol
+  in pane terminals instead of only skipping enablement.
+- Full description, verification record and known limits: see PATCH-NOTES.md
+- Corresponding source for this binary:
+  https://github.com/Banyan-leaf/herdr-kitty-graphics-patch
+  (apply the patch above to upstream commit b064806)
+
+This build is unofficial. It is not affiliated with, endorsed by, or
+supported by the Herdr project. The name "Herdr" is used only to identify
+the upstream project this patch applies to.

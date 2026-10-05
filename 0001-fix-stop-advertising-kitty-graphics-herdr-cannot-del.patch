@@ -1,0 +1,1212 @@
+From 450698e796f037e4b6a1207435e237800a90ec5d Mon Sep 17 00:00:00 2001
+From: banyanleaf <banyanleaf@localhost>
+Date: Tue, 6 Oct 2026 03:35:51 +0800
+Subject: [PATCH] fix: stop advertising kitty graphics herdr cannot deliver
+
+Pane terminals answered a child's Kitty graphics capability query from their
+own parser state, which never reflected what Herdr could render. A probing
+TUI therefore chose Kitty over Sixel (or over its text fallback), painted a
+raster, and nothing appeared - while the fallback it had been showing was
+already replaced. On terminals without the protocol the text art vanished
+too, so the only symptom was a brief flash and no error.
+
+Two gaps caused that:
+
+- terminal.kitty_graphics = false only skipped enabling the protocol, so the
+  pane terminal kept libghostty's default image quota and still answered a=q
+  with OK. A zero quota disables the protocol outright, which is what the
+  setting promises.
+- The outer terminal's own capability was never consulted. The client now
+  probes it before the handshake (the a=q plus DA1 sentinel query that
+  image-capable TUIs send), reports the answer as an optional endpoint hello
+  field, and the server gates pane graphics on the setting and on an attached
+  client that can render. Live pane terminals are re-applied when that answer
+  changes; a client that never reports it, and a session with no client
+  attached, keep the previous optimistic answer.
+
+Verified on Windows Terminal from WSL: a pane child now receives only DA1 and
+falls back to its text art, while Kitty, Ghostty and WezTerm keep answering
+OK. Windows clients keep the optimistic answer; they have no host probe yet.
+---
+ crates/ghostty-vt/src/lib.rs                  |  55 ++++
+ src/client/endpoint/supervisor.rs             |   3 +
+ src/client/handshake.rs                       |   6 +
+ src/client/loop_config.rs                     |   2 +
+ src/client/mod.rs                             |  25 ++
+ src/client/state.rs                           |   3 +
+ src/client/terminal_sessions.rs               |   1 +
+ src/client/terminal_setup.rs                  | 289 ++++++++++++++++++
+ src/kitty_graphics.rs                         |  95 +++++-
+ src/pane.rs                                   |  25 +-
+ src/protocol/endpoint.rs                      |  14 +
+ src/server/client_transport.rs                |   7 +
+ src/server/clients.rs                         |   5 +
+ src/server/headless.rs                        |  36 +++
+ src/server/headless/tests/mod.rs              |  10 +
+ src/server/headless/tests/pane_graphics.rs    |  76 +++++
+ src/server/headless/tests/surface_interest.rs |   5 +
+ src/terminal/runtime.rs                       |   5 +
+ 18 files changed, 651 insertions(+), 11 deletions(-)
+
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index 7deaaa8..b25f8d1 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -1059,6 +1059,28 @@ impl Terminal {
+         Ok(())
+     }
+ 
++    /// Disable the Kitty graphics protocol for this terminal.
++    ///
++    /// libghostty treats a zero image-storage limit as "images unsupported":
++    /// every graphics command is ignored and capability queries (`a=q`) go
++    /// unanswered, so a probing child sees a terminal without the protocol.
++    /// A terminal that cannot have its placements rendered must reach this
++    /// state, otherwise the child is told "supported" and paints images that
++    /// never appear.
++    pub fn disable_kitty_graphics(&mut self) -> Result<(), Error> {
++        let storage_limit: u64 = 0;
++        // SAFETY: self.raw is a live terminal handle and storage_limit is a plain value.
++        unsafe {
++            ffi::ghostty_terminal_set(
++                self.raw,
++                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
++                (&storage_limit as *const u64).cast(),
++            )
++            .into_result()?;
++        }
++        Ok(())
++    }
++
+     pub fn enable_kitty_graphics(&mut self) -> Result<(), Error> {
+         install_png_decoder_once();
+         let storage_limit = KITTY_IMAGE_STORAGE_LIMIT_BYTES;
+@@ -4019,6 +4041,39 @@ mod tests {
+         assert!(!terminal.kitty_graphics_may_have_placements().unwrap());
+     }
+ 
++    #[test]
++    fn disabled_kitty_graphics_ignores_protocol_and_capability_queries() {
++        let mut terminal = Terminal::new(10, 5, 0).unwrap();
++        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
++        let sink = responses.clone();
++        terminal
++            .set_write_pty_callback(move |bytes| sink.lock().unwrap().extend_from_slice(bytes))
++            .unwrap();
++
++        // The capability query a probing TUI sends: one transparent RGBA pixel
++        // in direct data, answered with OK while the protocol is usable.
++        const QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=32;AAAAAA==\x1b\\";
++        terminal.enable_kitty_graphics().unwrap();
++        terminal.write(QUERY);
++        let reply = String::from_utf8_lossy(&responses.lock().unwrap()[..]).into_owned();
++        assert!(reply.contains("OK"), "{reply}");
++
++        // Positive control: the same paint command does place an image here.
++        terminal.write(b"\x1b_Ga=T,t=d,f=24,i=7,s=1,v=2,c=1,r=1;////////\x1b\\");
++        assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
++
++        responses.lock().unwrap().clear();
++        terminal.disable_kitty_graphics().unwrap();
++        terminal.write(QUERY);
++        terminal.write(b"\x1b_Ga=T,t=d,f=24,i=8,s=1,v=2,c=1,r=1;////////\x1b\\");
++
++        // Disabled graphics are indistinguishable from an unsupported terminal:
++        // no reply to the query, no stored image, no placement.
++        assert!(responses.lock().unwrap().is_empty());
++        assert!(terminal.kitty_image_placements().unwrap().is_empty());
++        assert!(!terminal.kitty_graphics_may_have_placements().unwrap());
++    }
++
+     #[test]
+     fn build_info_contract_matches_expected_vendored_features() {
+         let _simd = build_info_bool(ffi::GhosttyBuildInfo_GHOSTTY_BUILD_INFO_SIMD);
+diff --git a/src/client/endpoint/supervisor.rs b/src/client/endpoint/supervisor.rs
+index 5b4e7ad..db41c85 100644
+--- a/src/client/endpoint/supervisor.rs
++++ b/src/client/endpoint/supervisor.rs
+@@ -23,6 +23,8 @@ pub(crate) struct EndpointConnectOptions {
+     pub(crate) surface_size: ClientSurfaceSize,
+     pub(crate) endpoint_keybindings: bool,
+     pub(crate) mouse_capture: bool,
++    /// Whether the local outer terminal can render Kitty placements.
++    pub(crate) host_kitty_graphics: bool,
+ }
+ 
+ pub(crate) enum EndpointSupervisorEvent {
+@@ -304,6 +306,7 @@ fn connect_once(
+         options.mouse_capture,
+         false,
+         matches!(target, ConnectTarget::Local(_)),
++        options.host_kitty_graphics,
+     )
+     .map_err(handshake_error)?;
+     if handshake.encoding != RenderEncoding::SemanticFrame {
+diff --git a/src/client/handshake.rs b/src/client/handshake.rs
+index 2520286..6875725 100644
+--- a/src/client/handshake.rs
++++ b/src/client/handshake.rs
+@@ -150,6 +150,7 @@ pub(crate) fn probe_endpoint_negotiation(
+         false,
+         false,
+         false, // This probe uses an SSH bridge, not a shared filesystem.
++        false, // No terminal to render placements, so never claim support.
+     )
+     .map_err(io::Error::other)?;
+     Ok(super::endpoint::EndpointNegotiation::new(
+@@ -164,6 +165,9 @@ pub(crate) fn probe_endpoint_negotiation(
+ /// shells use the stable endpoint generation and negotiate whole codecs without
+ /// comparing Herdr build versions. `local_transport` means the endpoint shares the
+ /// client's filesystem, not merely that its bridge exposes a local socket.
++/// `host_kitty_graphics` is the outer terminal's own answer to the graphics
++/// capability probe; the server decides what a pane tells its child from it.
++#[allow(clippy::too_many_arguments)] // One immutable launch snapshot, not shared state.
+ pub(super) fn do_handshake(
+     stream: &mut LocalStream,
+     cols: u16,
+@@ -176,6 +180,7 @@ pub(super) fn do_handshake(
+     mouse_capture: bool,
+     surface_active: bool,
+     local_transport: bool,
++    host_kitty_graphics: bool,
+ ) -> Result<HandshakeResult, ClientError> {
+     stream
+         .set_nonblocking(false)
+@@ -195,6 +200,7 @@ pub(super) fn do_handshake(
+                 (cell_width_px, cell_height_px),
+                 direct_graphics_profile_allowed(),
+             ),
++            kitty_graphics: host_kitty_graphics,
+             endpoint_keybindings,
+             mouse_capture,
+             surface_active,
+diff --git a/src/client/loop_config.rs b/src/client/loop_config.rs
+index 97979bb..ea0786e 100644
+--- a/src/client/loop_config.rs
++++ b/src/client/loop_config.rs
+@@ -6,6 +6,8 @@ pub(super) struct ClientLoopConfig {
+     pub(super) redraw_on_focus_gained: bool,
+     pub(super) host_cursor: crate::config::HostCursorModeConfig,
+     pub(super) kitty_graphics_enabled: bool,
++    /// Whether the outer terminal answered the Kitty graphics capability probe.
++    pub(super) host_kitty_graphics: bool,
+     pub(super) pixel_geometry_enabled: bool,
+     pub(super) pixel_geometry_fallback: bool,
+     pub(super) mouse_capture_active: bool,
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 6a754e1..88e1331 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -192,6 +192,21 @@ fn run_client_with_mode(
+     let kitty_graphics_enabled =
+         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
+     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
++    // Ask the outer terminal itself before the handshake: the server decides
++    // what a child inside a pane is told about Kitty graphics from this answer,
++    // and a pane's terminal is created as soon as the client attaches.
++    let host_graphics_probe = if kitty_graphics_enabled {
++        terminal_setup::probe_host_kitty_graphics()
++    } else {
++        terminal_setup::HostGraphicsProbe {
++            // Graphics are off for this client, so no pane may advertise them.
++            renders_kitty_graphics: false,
++            buffered_input: Vec::new(),
++        }
++    };
++    let host_kitty_graphics = host_graphics_probe.renders_kitty_graphics;
++    let host_graphics_input = host_graphics_probe.buffered_input;
++
+     let endpoint_keybindings = shell_config
+         .as_ref()
+         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
+@@ -201,6 +216,7 @@ fn run_client_with_mode(
+         redraw_on_focus_gained,
+         host_cursor,
+         kitty_graphics_enabled,
++        host_kitty_graphics,
+         pixel_geometry_enabled,
+         pixel_geometry_fallback: kitty_graphics_enabled,
+         mouse_capture_active: mouse_capture,
+@@ -260,6 +276,7 @@ fn run_client_with_mode(
+                 loop_config.mouse_capture_active,
+                 true,
+                 !is_remote_client_process(),
++                host_kitty_graphics,
+             )
+             .map_err(|error| io::Error::other(error.to_string()))?;
+             if federated
+@@ -309,6 +326,12 @@ fn run_client_with_mode(
+     loop_config.host_escape_disambiguation_active =
+         terminal_guard.host_escape_disambiguation_active();
+     loop_config.initial_host_input = terminal_guard.take_buffered_host_input();
++    if !host_graphics_input.is_empty() {
++        // Bytes typed while the graphics query was in flight arrived first.
++        let mut buffered = host_graphics_input;
++        buffered.extend_from_slice(&loop_config.initial_host_input);
++        loop_config.initial_host_input = buffered;
++    }
+ 
+     // Install a panic hook so the foreground client always restores its terminal.
+     let panic_restore = terminal_guard.panic_restore();
+@@ -447,6 +470,7 @@ async fn run_client_loop(
+         reported_cell_size: (initial_cell_width_px, initial_cell_height_px),
+         sound_config: config.sound_config,
+         kitty_graphics_enabled: config.kitty_graphics_enabled,
++        host_kitty_graphics: config.host_kitty_graphics,
+         pixel_geometry_enabled: config.pixel_geometry_enabled,
+         pixel_geometry_exact: initial_pixel_geometry_exact,
+         #[cfg(unix)]
+@@ -753,6 +777,7 @@ async fn run_client_loop(
+                     surface_size: shell.surface_size(state.reported_size.0, state.reported_size.1),
+                     endpoint_keybindings: config.endpoint_keybindings,
+                     mouse_capture: state.shell_mouse_capture_preference,
++                    host_kitty_graphics: state.host_kitty_graphics,
+                 },
+                 &supervisor_tx,
+             );
+diff --git a/src/client/state.rs b/src/client/state.rs
+index 2cadfa6..3e8df83 100644
+--- a/src/client/state.rs
++++ b/src/client/state.rs
+@@ -49,6 +49,8 @@ pub(super) struct ClientState {
+     pub(super) reported_cell_size: (u32, u32),
+     pub(super) sound_config: crate::config::SoundConfig,
+     pub(super) kitty_graphics_enabled: bool,
++    /// Whether this client's outer terminal can render Kitty placements.
++    pub(super) host_kitty_graphics: bool,
+     pub(super) pixel_geometry_enabled: bool,
+     pub(super) pixel_geometry_exact: bool,
+     #[cfg(unix)]
+@@ -112,6 +114,7 @@ impl ClientState {
+             reported_cell_size: (0, 0),
+             sound_config: Default::default(),
+             kitty_graphics_enabled: false,
++            host_kitty_graphics: false,
+             pixel_geometry_enabled: false,
+             pixel_geometry_exact: false,
+             #[cfg(unix)]
+diff --git a/src/client/terminal_sessions.rs b/src/client/terminal_sessions.rs
+index aeecbf4..28cf6bc 100644
+--- a/src/client/terminal_sessions.rs
++++ b/src/client/terminal_sessions.rs
+@@ -101,6 +101,7 @@ fn connect_terminal_session_stream(
+         false,
+         true,
+         true,
++        false,
+     ) {
+         Ok(handshake) if handshake.encoding == RenderEncoding::TerminalAnsi => {}
+         Ok(handshake) => {
+diff --git a/src/client/terminal_setup.rs b/src/client/terminal_setup.rs
+index 249e29a..ace0316 100644
+--- a/src/client/terminal_setup.rs
++++ b/src/client/terminal_setup.rs
+@@ -1,5 +1,7 @@
+ //! Terminal setup and restoration for the rendered client.
+ 
++#[cfg(not(windows))]
++use std::io::IsTerminal as _;
+ use std::io::{self, Write as _};
+ #[cfg(not(windows))]
+ use std::os::fd::AsRawFd as _;
+@@ -321,6 +323,217 @@ fn host_control_string_end(bytes: &[u8]) -> Option<Option<usize>> {
+     Some(None)
+ }
+ 
++/// Outcome of the pre-handshake outer-terminal graphics probe.
++pub(super) struct HostGraphicsProbe {
++    /// True when the outer terminal answered the Kitty capability query.
++    pub(super) renders_kitty_graphics: bool,
++    /// Host input read while probing, replayed into the input loop.
++    pub(super) buffered_input: Vec<u8>,
++}
++
++#[cfg(not(windows))]
++const HOST_GRAPHICS_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
++/// One transparent RGBA pixel as zlib-compressed direct data, followed by the
++/// DA1 sentinel. Terminals answer queries in order, so a terminal that
++/// implements the protocol replies before the sentinel and one that does not
++/// answers only the sentinel. This is the query image-capable TUIs send.
++#[cfg(not(windows))]
++const HOST_GRAPHICS_QUERY: &[u8] =
++    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=32,o=z;eAFjYGBgAAAABAAB\x1b\\\x1b[c";
++#[cfg(not(windows))]
++const HOST_GRAPHICS_QUERY_IMAGE_ID: u32 = 31;
++
++/// Ask the outer terminal whether it can load and display images.
++///
++/// Only positive evidence removes the capability: a terminal that never
++/// answers, or that answers the DA1 sentinel first, cannot show placements.
++/// Anything inconclusive keeps the optimistic answer, so an interactive
++/// terminal that was working before this probe existed keeps working.
++///
++/// Runs before the handshake, so it owns raw mode for the duration of the
++/// query (terminal replies are not line-delimited) and restores the previous
++/// mode before returning. Host input read meanwhile is returned for replay.
++#[cfg(not(windows))]
++pub(super) fn probe_host_kitty_graphics() -> HostGraphicsProbe {
++    if !io::stdin().is_terminal() || crossterm::terminal::enable_raw_mode().is_err() {
++        return HostGraphicsProbe {
++            renders_kitty_graphics: true,
++            buffered_input: Vec::new(),
++        };
++    }
++    let probe = probe_host_kitty_graphics_raw();
++    let _ = crossterm::terminal::disable_raw_mode();
++    probe
++}
++
++/// Windows keeps the optimistic answer: the Windows input backend has no
++/// non-blocking host query yet, so graphics stay enabled exactly as they were
++/// before this probe existed.
++#[cfg(windows)]
++pub(super) fn probe_host_kitty_graphics() -> HostGraphicsProbe {
++    HostGraphicsProbe {
++        renders_kitty_graphics: true,
++        buffered_input: Vec::new(),
++    }
++}
++
++#[cfg(not(windows))]
++fn probe_host_kitty_graphics_raw() -> HostGraphicsProbe {
++    let mut buffered_input = Vec::new();
++    if io::stdout()
++        .write_all(HOST_GRAPHICS_QUERY)
++        .and_then(|()| io::stdout().flush())
++        .is_err()
++    {
++        return HostGraphicsProbe {
++            renders_kitty_graphics: true,
++            buffered_input,
++        };
++    }
++
++    let mut saw_graphics_reply = false;
++    let mut saw_sentinel = false;
++    // Bypass StdinLock's shared buffer so poll and read observe the same bytes.
++    let stdin = io::stdin();
++    let stdin_fd = stdin.as_raw_fd();
++    let deadline = Instant::now() + HOST_GRAPHICS_QUERY_TIMEOUT;
++    while !saw_sentinel && buffered_input.len() < MAX_BUFFERED_HOST_INPUT {
++        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
++            break;
++        };
++        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
++        match crate::platform::poll_fd_readable(stdin_fd, timeout_ms) {
++            Ok(true) => {}
++            Ok(false) => break,
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
++            Err(err) => {
++                tracing::debug!(%err, "host graphics query read unavailable");
++                break;
++            }
++        }
++
++        let mut scratch = [0u8; 4096];
++        let capacity = MAX_BUFFERED_HOST_INPUT - buffered_input.len();
++        let read_limit = capacity.min(scratch.len());
++        match crate::platform::read_fd(stdin_fd, &mut scratch[..read_limit]) {
++            Ok(0) => break,
++            Ok(read) => {
++                buffered_input.extend_from_slice(&scratch[..read]);
++                consume_host_graphics_probe_responses(
++                    &mut buffered_input,
++                    &mut saw_graphics_reply,
++                    &mut saw_sentinel,
++                );
++            }
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
++            Err(err) => {
++                tracing::debug!(%err, "host graphics query read failed");
++                break;
++            }
++        }
++    }
++
++    HostGraphicsProbe {
++        // Only the terminal's own OK reply proves support; silence, or a
++        // sentinel answered first, means placements would never appear.
++        renders_kitty_graphics: saw_graphics_reply,
++        buffered_input,
++    }
++}
++
++/// Consume this probe's own replies: the graphics reply and the DA1 sentinel.
++/// Everything else stays buffered for the input loop (the user can type while
++/// the query is in flight).
++#[cfg(not(windows))]
++fn consume_host_graphics_probe_responses(
++    buffered_input: &mut Vec<u8>,
++    saw_graphics_reply: &mut bool,
++    saw_sentinel: &mut bool,
++) {
++    let mut offset = 0;
++    while offset < buffered_input.len() {
++        let rest = &buffered_input[offset..];
++        if let Some(payload) = rest.strip_prefix(b"\x1b_G") {
++            let Some(terminator) = payload.windows(2).position(|bytes| bytes == b"\x1b\\") else {
++                break;
++            };
++            let sequence_end = offset + 3 + terminator + 2;
++            let sequence = &buffered_input[offset..sequence_end];
++            match kitty_graphics_reply_image_id(sequence) {
++                // Our own reply: consume it, and remember whether it said OK.
++                Some(image_id) if image_id == HOST_GRAPHICS_QUERY_IMAGE_ID => {
++                    *saw_graphics_reply |= kitty_graphics_reply_is_ok(sequence);
++                    buffered_input.drain(offset..sequence_end);
++                    continue;
++                }
++                // Some other APC payload: leave it for the input loop.
++                _ => {
++                    offset = sequence_end;
++                    continue;
++                }
++            }
++        }
++        if rest.starts_with(b"\x1b[") {
++            // DA1 is CSI ? Pp ; Ps... c: the private marker is part of it.
++            let mut end = offset + 2;
++            while end < buffered_input.len()
++                && (buffered_input[end].is_ascii_digit()
++                    || buffered_input[end] == b';'
++                    || buffered_input[end] == b'?')
++            {
++                end += 1;
++            }
++            match buffered_input.get(end) {
++                // Incomplete sequence: wait for the rest.
++                None => break,
++                Some(b'c') => {
++                    *saw_sentinel = true;
++                    buffered_input.drain(offset..=end);
++                    continue;
++                }
++                Some(_) => {
++                    offset += 1;
++                    continue;
++                }
++            }
++        }
++        offset += 1;
++    }
++}
++
++/// The image id of a Kitty graphics reply, when the sequence is one.
++#[cfg(not(windows))]
++fn kitty_graphics_reply_image_id(sequence: &[u8]) -> Option<u32> {
++    let control = kitty_graphics_reply_control(sequence)?;
++    control
++        .split(|byte| *byte == b',')
++        .find_map(|field| field.strip_prefix(b"i="))
++        .and_then(|value| std::str::from_utf8(value).ok())
++        .and_then(|value| value.parse().ok())
++}
++
++/// Whether a Kitty graphics reply reports success.
++#[cfg(not(windows))]
++fn kitty_graphics_reply_is_ok(sequence: &[u8]) -> bool {
++    let Some(payload) = sequence
++        .strip_prefix(b"\x1b_G")
++        .and_then(|payload| payload.strip_suffix(b"\x1b\\"))
++    else {
++        return false;
++    };
++    let Some(separator) = payload.iter().position(|byte| *byte == b';') else {
++        return false;
++    };
++    payload[separator + 1..].starts_with(b"OK")
++}
++
++#[cfg(not(windows))]
++fn kitty_graphics_reply_control(sequence: &[u8]) -> Option<&[u8]> {
++    let payload = sequence.strip_prefix(b"\x1b_G")?.strip_suffix(b"\x1b\\")?;
++    let separator = payload.iter().position(|byte| *byte == b';')?;
++    Some(&payload[..separator])
++}
++
+ #[cfg(windows)]
+ fn query_host_escape_disambiguation() -> (bool, Vec<u8>) {
+     (false, Vec::new())
+@@ -984,4 +1197,80 @@ mod tests {
+             b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l"
+         );
+     }
++
++    #[cfg(not(windows))]
++    #[test]
++    fn graphics_probe_reads_only_its_own_replies() {
++        let mut buffered = Vec::new();
++        let mut reply = false;
++        let mut sentinel = false;
++
++        // A graphics reply followed by the sentinel: supported, both consumed.
++        buffered.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c");
++        consume_host_graphics_probe_responses(&mut buffered, &mut reply, &mut sentinel);
++        assert!(reply);
++        assert!(sentinel);
++        assert!(buffered.is_empty());
++
++        // A terminal without the protocol answers only the sentinel.
++        let mut buffered = b"\x1b[?61;4;6c".to_vec();
++        let mut reply = false;
++        let mut sentinel = false;
++        consume_host_graphics_probe_responses(&mut buffered, &mut reply, &mut sentinel);
++        assert!(!reply);
++        assert!(sentinel);
++        assert!(buffered.is_empty());
++    }
++
++    #[cfg(not(windows))]
++    #[test]
++    fn graphics_probe_keeps_typed_input_and_waits_for_a_complete_reply() {
++        // Typed input plus the first half of the reply, in one read.
++        let mut buffered = b"hi\x1b_Gi=31;O".to_vec();
++        let mut reply = false;
++        let mut sentinel = false;
++        consume_host_graphics_probe_responses(&mut buffered, &mut reply, &mut sentinel);
++        assert!(!reply);
++        assert!(!sentinel);
++        assert_eq!(buffered, b"hi\x1b_Gi=31;O", "an incomplete reply is kept");
++
++        // The rest arrives: the reply is consumed, the typed bytes are not.
++        buffered.extend_from_slice(b"K\x1b\\");
++        consume_host_graphics_probe_responses(&mut buffered, &mut reply, &mut sentinel);
++        assert!(reply);
++        assert!(!sentinel);
++        assert_eq!(buffered, b"hi");
++    }
++
++    #[cfg(not(windows))]
++    #[test]
++    fn graphics_probe_ignores_foreign_graphics_replies() {
++        let mut buffered = b"\x1b_Gi=7;ENOENT\x1b\\".to_vec();
++        let mut reply = false;
++        let mut sentinel = false;
++        consume_host_graphics_probe_responses(&mut buffered, &mut reply, &mut sentinel);
++        assert!(!reply);
++        assert_eq!(
++            buffered, b"\x1b_Gi=7;ENOENT\x1b\\",
++            "another image's reply belongs to the input loop"
++        );
++    }
++
++    #[cfg(not(windows))]
++    #[test]
++    fn graphics_probe_reply_requires_an_ok_for_its_own_image() {
++        assert_eq!(
++            kitty_graphics_reply_image_id(b"\x1b_Gi=31;OK\x1b\\"),
++            Some(31)
++        );
++        assert_eq!(
++            kitty_graphics_reply_image_id(b"\x1b_Gi=31,I=5,p=1;OK\x1b\\"),
++            Some(31)
++        );
++        assert_eq!(kitty_graphics_reply_image_id(b"\x1b_Gi=31;OK"), None);
++        assert_eq!(kitty_graphics_reply_image_id(b"\x1b_G31;OK\x1b\\"), None);
++        assert!(kitty_graphics_reply_is_ok(b"\x1b_Gi=31;OK\x1b\\"));
++        assert!(kitty_graphics_reply_is_ok(b"\x1b_Gi=31,p=1;OK\x1b\\"));
++        assert!(!kitty_graphics_reply_is_ok(b"\x1b_Gi=31;EINVAL\x1b\\"));
++    }
+ }
+diff --git a/src/kitty_graphics.rs b/src/kitty_graphics.rs
+index f26cd8d..affea91 100644
+--- a/src/kitty_graphics.rs
++++ b/src/kitty_graphics.rs
+@@ -111,13 +111,56 @@ pub(crate) struct HostGraphicsCache {
+ }
+ 
+ static KITTY_GRAPHICS_ENABLED: AtomicBool = AtomicBool::new(false);
++/// Whether any attached client can render placements. Optimistic until a client
++/// reports otherwise, so a client that never probed its host keeps the images
++/// it renders today.
++static KITTY_GRAPHICS_DELIVERABLE: AtomicBool = AtomicBool::new(true);
+ 
+ pub(crate) fn set_enabled(enabled: bool) {
+     KITTY_GRAPHICS_ENABLED.store(enabled, Ordering::Release);
+ }
+ 
++/// Record whether any attached client can render placements.
++///
++/// Returns true when the answer changed, which is the signal to update live
++/// pane terminals (see `server::headless::refresh_kitty_graphics_delivery`).
++pub(crate) fn set_deliverable(deliverable: bool) -> bool {
++    KITTY_GRAPHICS_DELIVERABLE.swap(deliverable, Ordering::AcqRel) != deliverable
++}
++
++/// Whether any attached client can render placements right now.
++pub(crate) fn deliverable() -> bool {
++    KITTY_GRAPHICS_DELIVERABLE.load(Ordering::Acquire)
++}
++
++/// Whether Herdr accepts and delivers Kitty graphics right now: enabled by
++/// configuration *and* renderable by an attached client.
+ pub(crate) fn is_enabled() -> bool {
+-    KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
++    KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire) && deliverable()
++}
++
++/// Apply the session's Kitty graphics capability to one pane terminal.
++///
++/// The pane terminal answers a child's capability probe (`a=q`) from its own
++/// image-storage state, so that state has to match what Herdr can actually
++/// deliver: enabled leaves placements to be forwarded to a client that can
++/// render them, disabled makes libghostty ignore the protocol entirely
++/// (including that probe). Telling a child "supported" while no attached client
++/// can draw the result is what makes a probing TUI paint invisible images
++/// instead of falling back to text art.
++pub(crate) fn apply_to_terminal(terminal: &mut crate::ghostty::Terminal) -> std::io::Result<()> {
++    apply_capability(terminal, is_enabled())
++}
++
++/// The capability decision itself, separated so it is testable without the
++/// process-wide flag.
++fn apply_capability(terminal: &mut crate::ghostty::Terminal, enabled: bool) -> std::io::Result<()> {
++    let applied = if enabled {
++        terminal.enable_kitty_graphics()
++    } else {
++        terminal.disable_kitty_graphics()
++    };
++    applied.map_err(|error| std::io::Error::other(error.to_string()))
+ }
+ 
+ pub(crate) fn image_transfer_estimated_size(data_len: usize) -> usize {
+@@ -1016,4 +1059,54 @@ mod tests {
+             &mut requested,
+         ));
+     }
++
++    #[test]
++    fn pane_terminal_capability_matches_the_decision() {
++        // `a=T` transmits and places in one command: the probe below shows
++        // whether a child that paints gets a placement at all.
++        let placed_after_paint = |enabled: bool| {
++            let mut terminal = crate::ghostty::Terminal::new(10, 5, 0).unwrap();
++            apply_capability(&mut terminal, enabled).unwrap();
++            terminal.write(b"\x1b_Ga=T,t=d,f=24,i=7,s=1,v=2,c=1,r=1;////////\x1b\\");
++            !terminal.kitty_image_placements().unwrap().is_empty()
++        };
++
++        assert!(placed_after_paint(true));
++        assert!(!placed_after_paint(false));
++    }
++
++    #[test]
++    fn disabling_a_live_terminal_drops_its_images_and_can_be_reenabled() {
++        let mut terminal = crate::ghostty::Terminal::new(10, 5, 0).unwrap();
++        apply_capability(&mut terminal, true).unwrap();
++        terminal.write(b"\x1b_Ga=T,t=d,f=24,i=7,s=1,v=2,c=1,r=1;////////\x1b\\");
++        assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
++
++        apply_capability(&mut terminal, false).unwrap();
++        assert!(terminal.kitty_image_placements().unwrap().is_empty());
++
++        // A later capable client must be able to turn the protocol back on
++        // without recreating the pane.
++        apply_capability(&mut terminal, true).unwrap();
++        terminal.write(b"\x1b_Ga=T,t=d,f=24,i=8,s=1,v=2,c=1,r=1;////////\x1b\\");
++        assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
++    }
++
++    /// This test owns the process-wide capability flag; `just test` runs each
++    /// test in its own process, which is why mutating it here is safe.
++    #[test]
++    fn graphics_capability_requires_the_setting_and_a_client_that_can_render() {
++        set_enabled(true);
++        assert!(set_deliverable(false), "the answer changed");
++        assert!(!is_enabled(), "no attached client can render placements");
++        assert!(!set_deliverable(false), "a repeated answer is not a change");
++
++        assert!(set_deliverable(true));
++        assert!(is_enabled());
++
++        set_enabled(false);
++        assert!(!is_enabled(), "the setting wins even with a capable client");
++
++        set_enabled(true);
++    }
+ }
+diff --git a/src/pane.rs b/src/pane.rs
+index 6e96e3b..ecb7749 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -2393,11 +2393,7 @@ impl PaneRuntime {
+         terminal
+             .resize(cols, rows, cell_width_px, cell_height_px)
+             .map_err(|e| std::io::Error::other(e.to_string()))?;
+-        if crate::kitty_graphics::is_enabled() {
+-            terminal
+-                .enable_kitty_graphics()
+-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+-        }
++        crate::kitty_graphics::apply_to_terminal(&mut terminal)?;
+         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
+         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+         let _ = pane_terminal.apply_host_terminal_appearance(host_terminal_appearance);
+@@ -2562,11 +2558,7 @@ impl PaneRuntime {
+         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
+         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
+             .map_err(|e| std::io::Error::other(e.to_string()))?;
+-        if crate::kitty_graphics::is_enabled() {
+-            terminal
+-                .enable_kitty_graphics()
+-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+-        }
++        crate::kitty_graphics::apply_to_terminal(&mut terminal)?;
+         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
+         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+         let _ = pane_terminal.apply_host_terminal_appearance(host_terminal_appearance);
+@@ -3719,6 +3711,19 @@ impl PaneRuntime {
+             None
+         }
+     }
++
++    /// Re-apply the session's Kitty graphics capability to this pane's terminal.
++    ///
++    /// Clients attach and detach at any time, and a child's capability probe
++    /// must see the current answer, so the terminal state follows it.
++    pub(crate) fn apply_kitty_graphics(&self) {
++        let Ok(mut core) = self.terminal.ghostty.core.lock() else {
++            return;
++        };
++        if let Err(error) = crate::kitty_graphics::apply_to_terminal(&mut core.terminal) {
++            warn!(pane = self.pane_id.raw(), %error, "failed to update Kitty graphics capability");
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/protocol/endpoint.rs b/src/protocol/endpoint.rs
+index d1e577c..70871f5 100644
+--- a/src/protocol/endpoint.rs
++++ b/src/protocol/endpoint.rs
+@@ -51,6 +51,11 @@ pub struct EndpointClientHello {
+     pub surface_size: ClientSurfaceSize,
+     pub pixel_mouse: bool,
+     pub direct_graphics: bool,
++    /// Whether this client's outer terminal can render Kitty graphics
++    /// placements. Absent means an older client that never probed its host;
++    /// Herdr keeps the previous optimistic answer for those.
++    #[serde(default = "default_true")]
++    pub kitty_graphics: bool,
+     pub endpoint_keybindings: bool,
+     pub mouse_capture: bool,
+     #[serde(default = "default_true")]
+@@ -209,6 +214,7 @@ mod tests {
+             surface_size: ClientSurfaceSize { cols: 80, rows: 24 },
+             pixel_mouse: true,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: true,
+             surface_active: true,
+@@ -357,6 +363,14 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn legacy_hello_keeps_graphics_enabled_without_the_capability_field() {
++        let mut value = serde_json::to_value(hello()).unwrap();
++        value.as_object_mut().unwrap().remove("kitty_graphics");
++        let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
++        assert!(decoded.kitty_graphics);
++    }
++
+     #[test]
+     fn legacy_hello_defaults_to_an_active_surface() {
+         let mut value = serde_json::to_value(hello()).unwrap();
+diff --git a/src/server/client_transport.rs b/src/server/client_transport.rs
+index 88daf25..6d4cd18 100644
+--- a/src/server/client_transport.rs
++++ b/src/server/client_transport.rs
+@@ -413,6 +413,7 @@ pub(crate) enum ServerEvent {
+         cell_height_px: u32,
+         pixel_mouse: bool,
+         direct_graphics: bool,
++        kitty_graphics: bool,
+         endpoint_keybindings: bool,
+         mouse_capture: bool,
+         surface_active: bool,
+@@ -781,6 +782,7 @@ pub(crate) fn handle_client_handshake(
+                 Some((
+                     hello.pixel_mouse,
+                     hello.direct_graphics,
++                    hello.kitty_graphics,
+                     hello.endpoint_keybindings,
+                     hello.mouse_capture,
+                     hello.surface_active,
+@@ -878,6 +880,7 @@ pub(crate) fn handle_client_handshake(
+     let connected = if let Some((
+         pixel_mouse,
+         direct_graphics,
++        kitty_graphics,
+         endpoint_keybindings,
+         mouse_capture,
+         surface_active,
+@@ -894,6 +897,7 @@ pub(crate) fn handle_client_handshake(
+             cell_height_px,
+             pixel_mouse,
+             direct_graphics,
++            kitty_graphics,
+             endpoint_keybindings,
+             mouse_capture,
+             surface_active,
+@@ -1471,6 +1475,7 @@ mod tests {
+             },
+             pixel_mouse: true,
+             direct_graphics: true,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: true,
+             surface_active: true,
+@@ -1989,6 +1994,7 @@ mod tests {
+                 cell_height_px,
+                 pixel_mouse,
+                 direct_graphics,
++                kitty_graphics,
+                 endpoint_keybindings,
+                 mouse_capture,
+                 surface_active,
+@@ -2005,6 +2011,7 @@ mod tests {
+                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
+                 assert!(pixel_mouse);
+                 assert!(direct_graphics);
++                assert!(kitty_graphics);
+                 assert!(endpoint_keybindings);
+                 assert!(mouse_capture);
+                 assert!(surface_active);
+diff --git a/src/server/clients.rs b/src/server/clients.rs
+index 65e875b..a60596b 100644
+--- a/src/server/clients.rs
++++ b/src/server/clients.rs
+@@ -145,6 +145,10 @@ pub(crate) struct ClientConnection {
+     pub(crate) shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
+     /// Passive eligibility for audited local Kitty regular-file graphics.
+     pub(crate) direct_graphics: bool,
++    /// Whether this client's outer terminal can render Kitty placements.
++    /// Optimistic until a client reports otherwise: a client that never probed
++    /// (older build, legacy protocol) must not lose images it renders today.
++    pub(crate) kitty_graphics: bool,
+     /// Whether this frontend preserves exact SGR pixel reports.
+     pub(crate) pixel_mouse: bool,
+     /// Last host terminal default colors reported by this client.
+@@ -231,6 +235,7 @@ impl ClientConnection {
+             render_state: ClientRenderState::new(render_encoding),
+             shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
+             direct_graphics: false,
++            kitty_graphics: true,
+             pixel_mouse: false,
+             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+             host_terminal_appearance: None,
+diff --git a/src/server/headless.rs b/src/server/headless.rs
+index 18869e0..95b3bdb 100644
+--- a/src/server/headless.rs
++++ b/src/server/headless.rs
+@@ -895,6 +895,37 @@ impl HeadlessServer {
+         self.app_client_count() > 0
+     }
+ 
++    /// Kitty placements are only worth accepting while a client that can render
++    /// them is attached.
++    ///
++    /// The pane terminal answers a child's capability probe from its own image
++    /// state, so when this answer changes the live terminals change with it:
++    /// panes created from now on pick it up at spawn, and existing panes are
++    /// re-applied here. Only a capability flip reaches this walk, never input or
++    /// output, so it costs one short lock per pane on attach and detach.
++    fn refresh_kitty_graphics_delivery(&mut self) {
++        let mut shell_clients = self
++            .clients
++            .values()
++            .filter(|client| client.is_shell_client());
++        let deliverable = match shell_clients.next() {
++            Some(first) => {
++                first.kitty_graphics || shell_clients.any(|client| client.kitty_graphics)
++            }
++            // No client is attached, so nothing disproves graphics. Placements a
++            // pane produces while detached stay in the terminal and render when
++            // a capable client comes back, which is how this behaved before the
++            // client capability was known.
++            None => true,
++        };
++        if !crate::kitty_graphics::set_deliverable(deliverable) {
++            return;
++        }
++        for runtime in self.app.terminal_runtimes.values() {
++            runtime.apply_kitty_graphics();
++        }
++    }
++
+     fn remove_client(&mut self, client_id: u64) -> bool {
+         self.disconnect_native_graphics(client_id);
+         let disconnected_focus = self
+@@ -915,6 +946,7 @@ impl HeadlessServer {
+         });
+         let was_foreground = self.foreground_client_id == Some(client_id);
+         let removed = self.clients.remove(&client_id);
++        self.refresh_kitty_graphics_delivery();
+         self.tab_geometry_controllers
+             .retain(|_, controller_id| *controller_id != client_id);
+         if let Some(mut removed) = removed {
+@@ -1846,6 +1878,7 @@ impl HeadlessServer {
+                 );
+                 connection.pixel_mouse = pixel_mouse;
+                 self.clients.insert(client_id, connection);
++                self.refresh_kitty_graphics_delivery();
+                 false
+             }
+             ServerEvent::ClientShellConnected {
+@@ -1856,6 +1889,7 @@ impl HeadlessServer {
+                 cell_height_px,
+                 pixel_mouse,
+                 direct_graphics,
++                kitty_graphics,
+                 endpoint_keybindings,
+                 mouse_capture,
+                 surface_active,
+@@ -1904,6 +1938,7 @@ impl HeadlessServer {
+                 );
+                 connection.pixel_mouse = pixel_mouse && observed.is_known();
+                 connection.direct_graphics = direct_graphics;
++                connection.kitty_graphics = kitty_graphics;
+                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
+                 connection.shell_mouse_capture = mouse_capture;
+                 connection.shell_surface_active = surface_active;
+@@ -1964,6 +1999,7 @@ impl HeadlessServer {
+                 connection.shell_agent_completions = Some(completion_projection);
+                 connection.shell_agent_view = agent_view;
+                 self.clients.insert(client_id, connection);
++                self.refresh_kitty_graphics_delivery();
+                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
+                     self.popup_owner_tab_id = self.shell_tab_id_for_client(client_id);
+                 }
+diff --git a/src/server/headless/tests/mod.rs b/src/server/headless/tests/mod.rs
+index 27f3bff..e9a9237 100644
+--- a/src/server/headless/tests/mod.rs
++++ b/src/server/headless/tests/mod.rs
+@@ -729,6 +729,7 @@ async fn client_shell_attach_seeds_workspace() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -759,6 +760,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
+         cell_height_px: 0,
+         pixel_mouse: false,
+         direct_graphics: false,
++        kitty_graphics: true,
+         endpoint_keybindings: false,
+         mouse_capture: false,
+         surface_active: false,
+@@ -821,6 +823,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -940,6 +943,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: false,
+@@ -1043,6 +1047,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
+             cell_height_px: 20,
+             pixel_mouse: true,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -1211,6 +1216,7 @@ fn connect_test_shell(
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -1816,6 +1822,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -1841,6 +1848,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: false,
+             surface_active: true,
+@@ -2761,6 +2769,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+@@ -3008,6 +3017,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
+             cell_height_px: 20,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: true,
+diff --git a/src/server/headless/tests/pane_graphics.rs b/src/server/headless/tests/pane_graphics.rs
+index 70904fd..062c038 100644
+--- a/src/server/headless/tests/pane_graphics.rs
++++ b/src/server/headless/tests/pane_graphics.rs
+@@ -620,3 +620,79 @@ async fn pixel_mouse_activation_follows_child_1016_without_graphics_demand() {
+         }
+     ));
+ }
++
++#[tokio::test]
++async fn pane_graphics_follow_the_attached_client_capability() {
++    // Owns the process-wide graphics capability; `just test` runs each test in
++    // its own process, so the flags cannot leak into another test.
++    crate::kitty_graphics::set_enabled(true);
++    crate::kitty_graphics::set_deliverable(true);
++
++    // The receivers stay alive here: dropping them makes the server treat the
++    // client as gone, which is the opposite of what this test drives.
++    fn shell_client(
++        client_id: u64,
++        kitty_graphics: bool,
++    ) -> (
++        ServerEvent,
++        std::sync::mpsc::Receiver<Vec<u8>>,
++        std::sync::mpsc::Receiver<Vec<u8>>,
++    ) {
++        let (writer, control_rx, render_rx) = test_client_writer();
++        (
++            ServerEvent::ClientShellConnected {
++                surface_reuse: false,
++                surface_delta: false,
++                surface_scroll: false,
++                client_id,
++                surface_cols: 80,
++                surface_rows: 24,
++                cell_width_px: 8,
++                cell_height_px: 16,
++                pixel_mouse: true,
++                direct_graphics: false,
++                kitty_graphics,
++                endpoint_keybindings: false,
++                mouse_capture: false,
++                surface_active: true,
++                writer,
++            },
++            control_rx,
++            render_rx,
++        )
++    }
++
++    let mut server = test_headless_server();
++    let mut workspace = crate::workspace::Workspace::test_new("graphics-capability");
++    let pane_id = workspace.focused_pane_id().expect("focused pane");
++    workspace.insert_test_runtime(
++        pane_id,
++        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
++    );
++    server.app.state.workspaces = vec![workspace];
++    server.app.state.active = Some(0);
++    server.app.state.selected = 0;
++    server.app.state.mode = crate::app::Mode::Terminal;
++
++    // A client whose outer terminal cannot render placements turns them off, so
++    // the live pane terminal stops advertising the protocol to its child.
++    let (event, _control_71, _render_71) = shell_client(71, false);
++    assert!(server.handle_server_event(event));
++    assert_eq!(server.clients.len(), 1, "the client stayed connected");
++    assert!(!crate::kitty_graphics::deliverable());
++
++    // One capable client is enough, even while an incapable one stays attached.
++    let (event, _control_72, _render_72) = shell_client(72, true);
++    assert!(server.handle_server_event(event));
++    assert!(crate::kitty_graphics::deliverable());
++    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 71 }));
++    assert!(crate::kitty_graphics::deliverable());
++
++    // Detaching everything leaves the answer optimistic: placements a pane
++    // produces while no client is attached stay renderable later.
++    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 72 }));
++    assert!(crate::kitty_graphics::deliverable());
++
++    crate::kitty_graphics::set_deliverable(true);
++    crate::kitty_graphics::set_enabled(true);
++}
+diff --git a/src/server/headless/tests/surface_interest.rs b/src/server/headless/tests/surface_interest.rs
+index a7da046..b7e3c3f 100644
+--- a/src/server/headless/tests/surface_interest.rs
++++ b/src/server/headless/tests/surface_interest.rs
+@@ -74,6 +74,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
+             cell_height_px: 18,
+             pixel_mouse: true,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: true,
+             surface_active: false,
+@@ -290,6 +291,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
+             cell_height_px: 0,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: false,
+             mouse_capture: false,
+             surface_active: false,
+@@ -404,6 +406,7 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
+             cell_height_px: 16,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: true,
+             surface_active: true,
+@@ -521,6 +524,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
+             cell_height_px: 16,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: true,
+             surface_active: true,
+@@ -545,6 +549,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
+             cell_height_px: 16,
+             pixel_mouse: false,
+             direct_graphics: false,
++            kitty_graphics: true,
+             endpoint_keybindings: true,
+             mouse_capture: true,
+             surface_active: false,
+diff --git a/src/terminal/runtime.rs b/src/terminal/runtime.rs
+index 39fc787..7503696 100644
+--- a/src/terminal/runtime.rs
++++ b/src/terminal/runtime.rs
+@@ -17,6 +17,11 @@ use crate::layout::PaneId;
+ pub struct TerminalRuntime(crate::pane::PaneRuntime);
+ 
+ impl TerminalRuntime {
++    /// Apply the session's Kitty graphics capability to this terminal.
++    pub fn apply_kitty_graphics(&self) {
++        self.0.apply_kitty_graphics();
++    }
++
+     pub fn shutdown(self) {
+         self.0.shutdown();
+     }
+-- 
+2.43.0
+
